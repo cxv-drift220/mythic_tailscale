@@ -44,13 +44,11 @@ def build_acl_policy(port, tcp_port=None):
                 "action": "accept",
                 "src": ["tag:agent"],
                 "dst": [f"tag:c2-server:{port_list}"],
-                "comment": "Agents can only reach the C2 server on the configured ports",
             },
             {
                 "action": "accept",
                 "src": ["tag:c2-server"],
                 "dst": [f"tag:agent:{port_list}"],
-                "comment": "C2 server can reach agents on the same ports (for reverse connections)",
             },
         ],
         "tagOwners": {
