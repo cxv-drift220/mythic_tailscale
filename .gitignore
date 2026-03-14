@@ -1,5 +1,6 @@
 # Secrets & credentials
 C2_Profiles/tailscale/tailscale/c2_code/config.json
+.tailscale_setup_state.json
 
 # Go build artifacts
 *.exe

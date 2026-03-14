@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-Tailscale Setup Script for Tailscale C2 Profile
+Setup Script for Tailscale C2 Profile (supports Tailscale and Headscale)
 
-Provisions all required Tailscale resources:
-  1. Validates API key and discovers tailnet
+Provisions all required resources:
+  1. Validates API key
   2. Sets ACL policy (agents can only reach c2-server)
   3. Creates server pre-auth key (tag:c2-server)
   4. Writes config.json for the C2 profile
 
-Usage:
+Usage (Tailscale):
   python3 setup_tailscale.py --api-key tskey-api-...
   python3 setup_tailscale.py --api-key tskey-api-... --hostname mythic-c2 --port 8080
+
+Usage (Headscale):
+  python3 setup_tailscale.py --provider headscale --control-url https://headscale.example.com --api-key hskey-api-...
+  python3 setup_tailscale.py --provider headscale --control-url https://headscale.example.com --api-key hskey-api-... --headscale-user 1
 """
 
 import argparse
@@ -29,6 +33,7 @@ C2_CONFIG_PATH = SCRIPT_DIR / "C2_Profiles" / "tailscale" / "tailscale" / "c2_co
 STATE_FILE = SCRIPT_DIR / ".tailscale_setup_state.json"
 
 TAILSCALE_API = "https://api.tailscale.com/api/v2"
+
 
 def build_acl_policy(port, tcp_port=None):
     """Build ACL policy restricting agents to only the C2 server's listen ports."""
@@ -58,28 +63,31 @@ def build_acl_policy(port, tcp_port=None):
     }
 
 
-def api(method, path, api_key, json_data=None):
+# ---------------------------------------------------------------------------
+# Tailscale API helpers
+# ---------------------------------------------------------------------------
+
+def ts_api(method, path, api_key, json_data=None):
     url = f"{TAILSCALE_API}{path}"
     headers = {"Authorization": f"Bearer {api_key}"}
     resp = requests.request(method, url, headers=headers, json=json_data)
     return resp
 
 
-def get_tailnet_info(api_key):
-    print("[*] Validating API key...")
-    # Use "-" as tailnet which auto-resolves
-    resp = api("GET", "/tailnet/-/devices", api_key)
+def ts_validate_key(api_key):
+    print("[*] Validating Tailscale API key...")
+    resp = ts_api("GET", "/tailnet/-/devices", api_key)
     if resp.status_code == 200:
         return True
     elif resp.status_code == 401:
-        print(f"[!] Invalid API key")
+        print("[!] Invalid API key")
         sys.exit(1)
     else:
         print(f"[!] API error ({resp.status_code}): {resp.text}")
         sys.exit(1)
 
 
-def set_acl_policy(api_key, port, tcp_port=None):
+def ts_set_acl_policy(api_key, port, tcp_port=None):
     policy = build_acl_policy(port, tcp_port)
     ports_str = port if not tcp_port or tcp_port == "0" else f"{port},{tcp_port}"
     print("[*] Setting ACL policy...")
@@ -87,7 +95,7 @@ def set_acl_policy(api_key, port, tcp_port=None):
     print(f"    - tag:c2-server -> tag:agent:{ports_str}     (allow)")
     print(f"    - everything else                            (deny)")
 
-    resp = api("POST", "/tailnet/-/acl", api_key, json_data=policy)
+    resp = ts_api("POST", "/tailnet/-/acl", api_key, json_data=policy)
     if resp.status_code == 200:
         print("[+] ACL policy set successfully")
     elif resp.status_code == 403:
@@ -99,7 +107,7 @@ def set_acl_policy(api_key, port, tcp_port=None):
         print("[*] You may need to set ACLs manually in the Tailscale admin console")
 
 
-def create_server_key(api_key):
+def ts_create_server_key(api_key):
     print("[*] Creating server pre-auth key (tag:c2-server, reusable)...")
     payload = {
         "capabilities": {
@@ -116,7 +124,7 @@ def create_server_key(api_key):
         "description": "Mythic Tailscale C2 server key",
     }
 
-    resp = api("POST", "/tailnet/-/keys", api_key, json_data=payload)
+    resp = ts_api("POST", "/tailnet/-/keys", api_key, json_data=payload)
     if resp.status_code != 200:
         print(f"[!] Failed to create server key ({resp.status_code}): {resp.text}")
         sys.exit(1)
@@ -131,7 +139,64 @@ def create_server_key(api_key):
     return key, key_id
 
 
-def write_c2_config(api_key, server_auth_key, hostname, port, tcp_port="8081"):
+# ---------------------------------------------------------------------------
+# Headscale API helpers
+# ---------------------------------------------------------------------------
+
+def hs_api(method, path, control_url, api_key, json_data=None):
+    url = f"{control_url.rstrip('/')}{path}"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    resp = requests.request(method, url, headers=headers, json=json_data, verify=True)
+    return resp
+
+
+def hs_validate_key(control_url, api_key):
+    print(f"[*] Validating Headscale API key against {control_url}...")
+    resp = hs_api("GET", "/api/v1/node", control_url, api_key)
+    if resp.status_code == 200:
+        return True
+    elif resp.status_code == 401:
+        print("[!] Invalid API key")
+        sys.exit(1)
+    else:
+        print(f"[!] API error ({resp.status_code}): {resp.text}")
+        sys.exit(1)
+
+
+def hs_create_server_key(control_url, api_key, user_id):
+    from datetime import datetime, timedelta, timezone
+    print(f"[*] Creating server pre-auth key (tag:c2-server, reusable, user={user_id})...")
+    expiration = (datetime.now(timezone.utc) + timedelta(days=90)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    payload = {
+        "user": str(user_id),
+        "reusable": True,
+        "ephemeral": False,
+        "aclTags": ["tag:c2-server"],
+        "expiration": expiration,
+    }
+
+    resp = hs_api("POST", "/api/v1/preauthkey", control_url, api_key, json_data=payload)
+    if resp.status_code != 200:
+        print(f"[!] Failed to create server key ({resp.status_code}): {resp.text}")
+        sys.exit(1)
+
+    data = resp.json()
+    key_data = data.get("preAuthKey", data)
+    key = key_data.get("key", "")
+    key_id = key_data.get("id", "")
+    print(f"[+] Server key created: {key[:20]}...")
+    print(f"    ID: {key_id}")
+    return key, key_id
+
+
+# ---------------------------------------------------------------------------
+# Config writers
+# ---------------------------------------------------------------------------
+
+def write_c2_config_tailscale(api_key, server_auth_key, hostname, port, tcp_port="8081"):
     config = {
         "auth_key": server_auth_key,
         "control_url": "https://controlplane.tailscale.com",
@@ -148,17 +213,35 @@ def write_c2_config(api_key, server_auth_key, hostname, port, tcp_port="8081"):
     print(f"[+] C2 config written to: {C2_CONFIG_PATH}")
 
 
-def save_state(server_key_id, hostname):
+def write_c2_config_headscale(api_key, server_auth_key, control_url, hostname, port, tcp_port="8081", headscale_user="1"):
+    config = {
+        "auth_key": server_auth_key,
+        "control_url": control_url,
+        "hostname": hostname,
+        "listen_port": port,
+        "tcp_port": tcp_port,
+        "api_key": api_key,
+        "headscale_user": headscale_user,
+        "provider": "headscale",
+    }
+    C2_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(C2_CONFIG_PATH, "w") as f:
+        json.dump(config, f, indent=4)
+    print(f"[+] C2 config written to: {C2_CONFIG_PATH}")
+
+
+def save_state(server_key_id, hostname, provider, control_url=""):
     state = {
         "server_key_id": server_key_id,
         "hostname": hostname,
-        "provider": "tailscale",
+        "provider": provider,
+        "control_url": control_url,
     }
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=4)
 
 
-def teardown(api_key):
+def teardown(args):
     if not STATE_FILE.exists():
         print("[!] No setup state found. Nothing to tear down.")
         sys.exit(1)
@@ -167,6 +250,7 @@ def teardown(api_key):
         state = json.load(f)
 
     server_key_id = state.get("server_key_id", "")
+    provider = state.get("provider", "tailscale")
 
     print(f"\n[!] This will:")
     print(f"    - Delete server auth key: {server_key_id}")
@@ -176,32 +260,42 @@ def teardown(api_key):
         print("[*] Aborted.")
         sys.exit(0)
 
-    if server_key_id:
+    if server_key_id and provider == "tailscale":
         print(f"[*] Deleting server key {server_key_id}...")
-        resp = api("DELETE", f"/tailnet/-/keys/{server_key_id}", api_key)
+        resp = ts_api("DELETE", f"/tailnet/-/keys/{server_key_id}", args.api_key)
         if resp.status_code in (200, 204):
             print("[+] Server key deleted")
         else:
             print(f"[!] Failed to delete key ({resp.status_code}): {resp.text}")
+    elif server_key_id and provider == "headscale":
+        control_url = state.get("control_url", args.control_url or "")
+        print(f"[*] Headscale pre-auth keys expire automatically. Key ID: {server_key_id}")
+        if control_url:
+            resp = hs_api("DELETE", f"/api/v1/preauthkey/{server_key_id}", control_url, args.api_key)
+            if resp.status_code in (200, 204):
+                print("[+] Server key deleted")
+            else:
+                print(f"[!] Could not delete key via API ({resp.status_code}): {resp.text}")
+                print("[*] Key will expire automatically")
 
     # Reset config
-    write_c2_config("", "", "mythic-c2", "8080", "8081")
+    write_c2_config_tailscale("", "", "mythic-c2", "8080", "8081")
     STATE_FILE.unlink(missing_ok=True)
     print("[+] Teardown complete")
 
 
-def setup(args):
+# ---------------------------------------------------------------------------
+# Main setup flows
+# ---------------------------------------------------------------------------
+
+def setup_tailscale(args):
     api_key = args.api_key
     hostname = args.hostname
     port = args.port
     tcp_port = args.tcp_port
 
-    if args.teardown:
-        teardown(api_key)
-        return
-
     print(f"\n{'=' * 60}")
-    print(f"  Tailscale C2 Profile - Setup")
+    print(f"  Tailscale C2 Profile - Setup (Tailscale)")
     print(f"{'=' * 60}")
     print(f"  Hostname:    {hostname}")
     print(f"  HTTP Port:   {port}")
@@ -209,21 +303,16 @@ def setup(args):
     print(f"  Config:      {C2_CONFIG_PATH}")
     print(f"{'=' * 60}\n")
 
-    # Step 1: Validate API key
-    get_tailnet_info(api_key)
+    ts_validate_key(api_key)
     print("[+] API key valid")
 
-    # Step 2: Set ACL policy (restricted to listen ports only)
-    set_acl_policy(api_key, port, tcp_port)
+    ts_set_acl_policy(api_key, port, tcp_port)
 
-    # Step 3: Create server pre-auth key
-    server_key, server_key_id = create_server_key(api_key)
+    server_key, server_key_id = ts_create_server_key(api_key)
 
-    # Step 4: Write config
-    write_c2_config(api_key, server_key, hostname, port, tcp_port)
+    write_c2_config_tailscale(api_key, server_key, hostname, port, tcp_port)
 
-    # Step 5: Save state
-    save_state(server_key_id, hostname)
+    save_state(server_key_id, hostname, "tailscale")
 
     print(f"\n{'=' * 60}")
     print(f"  Setup Complete!")
@@ -244,12 +333,87 @@ def setup(args):
     print(f"{'=' * 60}")
 
 
+def setup_headscale(args):
+    api_key = args.api_key
+    control_url = args.control_url
+    hostname = args.hostname
+    port = args.port
+    tcp_port = args.tcp_port
+    headscale_user = args.headscale_user
+
+    if not control_url:
+        print("[!] --control-url is required for headscale provider")
+        sys.exit(1)
+
+    print(f"\n{'=' * 60}")
+    print(f"  Tailscale C2 Profile - Setup (Headscale)")
+    print(f"{'=' * 60}")
+    print(f"  Control URL: {control_url}")
+    print(f"  User ID:     {headscale_user}")
+    print(f"  Hostname:    {hostname}")
+    print(f"  HTTP Port:   {port}")
+    print(f"  TCP Port:    {tcp_port}")
+    print(f"  Config:      {C2_CONFIG_PATH}")
+    print(f"{'=' * 60}\n")
+
+    # Step 1: Validate API key
+    hs_validate_key(control_url, api_key)
+    print("[+] API key valid")
+
+    # Step 2: ACL policy is managed via headscale config file, not API
+    print("[*] ACL policy: managed via /etc/headscale/acl.json on the headscale server")
+    print("[*] Ensure the following tags exist: tag:c2-server, tag:agent")
+
+    # Step 3: Create server pre-auth key
+    server_key, server_key_id = hs_create_server_key(control_url, api_key, headscale_user)
+
+    # Step 4: Write config
+    write_c2_config_headscale(api_key, server_key, control_url, hostname, port, tcp_port, headscale_user)
+
+    # Step 5: Save state
+    save_state(server_key_id, hostname, "headscale", control_url)
+
+    print(f"\n{'=' * 60}")
+    print(f"  Setup Complete!")
+    print(f"{'=' * 60}")
+    print(f"  Control URL:     {control_url}")
+    print(f"  Server Hostname: {hostname}")
+    print(f"  HTTP Port:       {port}")
+    print(f"  TCP Port:        {tcp_port}")
+    print(f"  Config written:  {C2_CONFIG_PATH}")
+    print(f"")
+    print(f"  Next steps:")
+    print(f"    1. Restart the tailscale C2 profile in Mythic")
+    print(f"       sudo ./mythic-cli c2 start tailscale")
+    print(f"    2. Build a cercopes payload")
+    print(f"    3. Run the payload on a target")
+    print(f"")
+    print(f"  To tear down:")
+    print(f"    python3 {__file__} --provider headscale --control-url {control_url} --api-key <key> --teardown")
+    print(f"{'=' * 60}")
+
+
+def setup(args):
+    if args.teardown:
+        teardown(args)
+        return
+
+    if args.provider == "headscale":
+        setup_headscale(args)
+    else:
+        setup_tailscale(args)
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Setup Tailscale resources for C2 Profile",
+        description="Setup Tailscale/Headscale resources for C2 Profile",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--api-key", required=True, help="Tailscale API key")
+    parser.add_argument("--provider", choices=["tailscale", "headscale"], default="tailscale",
+                        help="VPN provider (default: tailscale)")
+    parser.add_argument("--api-key", required=True, help="API key (Tailscale or Headscale)")
+    parser.add_argument("--control-url", default="", help="Headscale server URL (required for headscale provider)")
+    parser.add_argument("--headscale-user", default="1", help="Headscale user ID (default: 1)")
     parser.add_argument("--hostname", default="mythic-c2", help="Server hostname on tailnet (default: mythic-c2)")
     parser.add_argument("--port", default="8080", help="HTTP listen port on tailnet (default: 8080)")
     parser.add_argument("--tcp-port", default="8081", help="TCP listen port on tailnet (default: 8081)")

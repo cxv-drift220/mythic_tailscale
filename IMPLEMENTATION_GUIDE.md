@@ -30,6 +30,7 @@ For step 1, you can use [libtailscale](https://github.com/tailscale/libtailscale
 **What the C2 server handles:**
 
 - Joining the same tailnet
+- Validating its MagicDNS name matches the configured hostname (warns on mismatch — e.g., when Headscale appends a random suffix due to stale nodes)
 - Receiving HTTP POSTs from agents
 - Forwarding messages to the Mythic server
 - Relaying responses back
@@ -553,7 +554,8 @@ Looks like a long-lived HTTPS connection to a Tailscale relay server. Indistingu
 | Startup | `derpN.tailscale.com` | 3478 | UDP | STUN NAT detection | Always |
 | Data | C2 server's public IP | 41641 | UDP | Direct WireGuard tunnel | If reachable |
 | Data | `derpN.tailscale.com` | 443 | HTTPS | DERP relay (fallback) | If direct fails |
-| DNS | System resolver | 53 | UDP | Resolve Tailscale hostnames | Always (unless DoH) |
+| DNS | System resolver | 53 | UDP | Resolve Tailscale hostnames | Without DoH only |
+| DNS | DoH resolver (e.g. 1.1.1.1) | 443 | HTTPS | Resolve Tailscale/Headscale hostnames | With DoH enabled |
 
 With **Headscale**: replace `controlplane.tailscale.com` and `login.tailscale.com` with your domain. DERP relays can also be self-hosted, making the entire traffic pattern point to operator-controlled infrastructure.
 
@@ -575,15 +577,21 @@ Agents can set the `doh` build parameter to route Tailscale-related DNS through 
 - `*.tailscale.com` — control plane (`controlplane.tailscale.com`, `login.tailscale.com`), logging (`log.tailscale.com`), and DERP relay hostnames (`derpN.tailscale.com`)
 - The Headscale control URL hostname — automatically extracted from the `control_url` parameter (e.g., `headscale.example.com`)
 
-Implementation: DNS interception is applied at three layers before `tsnet.Up()`:
+Implementation: DNS interception uses a **selective `net.DefaultResolver` override** with domain-aware routing, applied before `tsnet.Up()`:
 
-1. **`dnscache.Get().Forward`** — the critical layer. tsnet's `dnscache` package creates a global singleton resolver at package init with `&net.Resolver{PreferGo: true}` (nil `Dial`). Both `controlhttp` (for `controlplane.tailscale.com`) and `logpolicy` (for `log.tailscale.com`) resolve DNS through `dnscache.Get().Forward`, completely bypassing `net.DefaultResolver`. Setting `.Forward` to our DoH resolver intercepts these lookups at the source.
-2. **`net.DefaultResolver`** — overridden with the same DoH resolver to catch any direct `net.LookupHost()` calls
-3. **`http.DefaultTransport.DialContext`** — patched with a `shouldDoH()` filter for selective resolution; non-matching domains fall through to a snapshot of the original system resolver
+1. **`net.DefaultResolver`** — overridden with a `selectiveDohConn` that intercepts ALL DNS in the Go process. This is the primary interception point — it catches tsnet's `controlhttp`, DERP client, `portmapper`, `logpolicy`, and any other internal code path that resolves hostnames. The `selectiveDohConn` parses the DNS query name from wire format (QNAME at offset 12 in the DNS header), checks it against `shouldDoH()`, and routes accordingly:
+   - **Matching domains** → forwarded as RFC 8484 `application/dns-message` POST to the DoH endpoint
+   - **Non-matching domains** → forwarded as raw UDP to the system DNS server (address captured from Go's resolver `Dial` callback)
+2. **`dnscache.Get().Forward`** — set to the same selective resolver. tsnet's `dnscache` singleton is created at package init with its own `&net.Resolver{}` that captures the pre-override `DefaultResolver`. Setting `.Forward` ensures `dnscache` lookups also route through our selective resolver.
+3. **`http.DefaultTransport.DialContext`** — patched as belt-and-suspenders for any HTTP client that resolves hostnames before dialing.
 
-The DoH resolver sends raw DNS wire-format queries as `application/dns-message` POST requests (RFC 8484) to the configured DoH URL. See `setupDoH()` in cercopes `main.go` or `ts_set_doh()` in `tailscale_ffi/main.go`.
+Additionally, two environment variables are set when DoH is enabled:
+- **`TS_DNSFALLBACK_DISABLE_RECURSIVE_RESOLVER=true`** — disables tsnet's `dnsfallback` recursive resolver, which otherwise performs a full iterative DNS walk (root → TLD → authoritative nameservers) in plaintext, bypassing all DoH interception
+- **`TS_DISABLE_PORTMAPPER=true`** — disables UPnP/NAT-PMP port mapping probes that generate detectable network traffic
 
-Since the DoH resolver addresses are IP literals (`1.1.1.1`, `8.8.8.8`), no DNS lookup is needed to reach them — the system DNS server never sees any Tailscale-related queries, while local domain resolution remains fully functional.
+**Linux TCP framing**: Go's pure-Go resolver on Linux prepends a 2-byte TCP length prefix to DNS queries even when dialing UDP. The `selectiveDohConn` detects this by checking if the first 2 bytes equal `len(remaining)` with a secondary DNS flags validation (QR=0, Opcode=0) to prevent false positives on Windows where the first 2 bytes are a random transaction ID. The prefix is stripped before forwarding and re-added to the response.
+
+Since the DoH resolver addresses are IP literals (`1.1.1.1`, `8.8.8.8`), no DNS lookup is needed to reach them — the system DNS server never sees any Tailscale-related queries, while local domain resolution remains fully functional for tools like BOFs, assemblies, and SOCKS proxies.
 
 #### What Defenders See
 
@@ -618,7 +626,15 @@ Since the DoH resolver addresses are IP literals (`1.1.1.1`, `8.8.8.8`), no DNS 
    headscale users create mythic
    ```
 
-3. Configure the C2 profile with `provider: "headscale"` and your Headscale URL.
+3. Run the setup script for Headscale:
+   ```bash
+   python3 setup_tailscale.py --provider headscale \
+       --control-url https://headscale.example.com \
+       --api-key hskey-api-... \
+       --headscale-user 1
+   ```
+
+   **Note**: Headscale v0.28+ requires numeric user IDs (`--headscale-user 1`), not usernames. ACL policy is managed via `/etc/headscale/acl.json` on the server, not via API.
 
 4. Start the C2 profile, build a payload, and run it.
 
@@ -626,6 +642,25 @@ Since the DoH resolver addresses are IP literals (`1.1.1.1`, `8.8.8.8`), no DNS 
    ```bash
    headscale nodes list
    ```
+
+6. **Important**: If the C2 server logs show a MagicDNS mismatch warning (hostname has a random suffix), delete stale nodes and rename:
+   ```bash
+   headscale nodes delete -i <stale_ID> --force
+   headscale nodes rename -i <active_ID> mythic-c2
+   ```
+
+### Testing with Tailscale Cloud
+
+1. Run the setup script for Tailscale:
+   ```bash
+   python3 setup_tailscale.py --api-key tskey-api-...
+   ```
+
+   This validates the API key, sets ACL policy, creates a server pre-auth key, and writes `config.json`.
+
+2. Start the C2 profile, build a payload, and run it.
+
+3. Verify at https://login.tailscale.com/admin/machines
 
 ### Verifying Communication
 
@@ -648,6 +683,9 @@ Check the agent's Tailscale IP:
 | `tsnet.Up` timeout | Can't reach control plane | Check network/firewall, verify `control_url` |
 | HTTP 404 from C2 server | Wrong hostname or port | Verify `server_hostname` matches C2 server's tailnet hostname |
 | Empty responses | Mythic server not reachable from C2 container | Check `MYTHIC_ADDRESS` env var and Docker networking |
+| `lookup mythic-c2 on 127.0.0.53:53: server misbehaving` | Agent resolves C2 hostname via system DNS instead of MagicDNS | C2 server's MagicDNS name doesn't match — see MagicDNS mismatch below |
+| MagicDNS name mismatch (e.g. `mythic-c2-abc123`) | Stale nodes with same hostname exist on control server; Headscale appends random suffix | Delete stale nodes: `headscale nodes delete -i <ID> --force`, then rename: `headscale nodes rename -i <ID> mythic-c2`. Or clear the C2 server's `ts-state/` directory and restart |
+| `authkey expired` | Headscale pre-auth key created without explicit `expiration` field | Headscale v0.28 treats missing expiration as Go zero time = already expired. The `generate_config` RPC and `setup_tailscale.py` now set explicit 90-day expiration |
 
 ---
 

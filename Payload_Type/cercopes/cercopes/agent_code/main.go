@@ -11,7 +11,6 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -540,6 +539,14 @@ func setupDoH(dohURL, controlURL string) {
 		return
 	}
 
+	// Disable tsnet's DNS fallback recursive resolver — it bypasses DoH and
+	// sends plaintext DNS queries to authoritative nameservers directly.
+	os.Setenv("TS_DNSFALLBACK_DISABLE_RECURSIVE_RESOLVER", "true")
+
+	// Disable UPnP/NAT-PMP port mapping probes — not needed for our use case
+	// and generates detectable network traffic.
+	os.Setenv("TS_DISABLE_PORTMAPPER", "true")
+
 	// Build the set of domains to resolve via DoH.
 	// Everything else falls through to the system resolver.
 	dohDomains := []string{".tailscale.com"}
@@ -558,18 +565,6 @@ func setupDoH(dohURL, controlURL string) {
 	}
 	dohClient := &http.Client{Timeout: 5 * time.Second, Transport: dohTransport}
 
-	// DoH resolver — only used for matching domains
-	dohResolver := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			return &dohConn{
-				ctx:       ctx,
-				dohURL:    dohURL,
-				dohClient: dohClient,
-			}, nil
-		},
-	}
-
 	shouldDoH := func(host string) bool {
 		lower := strings.ToLower(host)
 		for _, d := range dohDomains {
@@ -580,31 +575,42 @@ func setupDoH(dohURL, controlURL string) {
 		return false
 	}
 
-	// Override the process-wide default resolver so that direct net.LookupHost
-	// calls also go through DoH.
-	systemResolver := *net.DefaultResolver // snapshot the current system resolver
-	net.DefaultResolver = dohResolver
+	// Override net.DefaultResolver with a selective resolver.
+	// This is the ONLY way to catch ALL DNS code paths in the Go process:
+	// tsnet's controlhttp, DERP client, portmapper, logpolicy, and any other
+	// internal code that calls net.LookupHost / net.Dial with hostnames.
+	// The selectiveDohConn parses the DNS query wire format to extract the
+	// queried domain name, then routes matching domains to DoH and everything
+	// else to the system DNS server.
+	//
+	// The Dial callback receives the system DNS server address (e.g. "127.0.0.53:53")
+	// which we capture and pass to selectiveDohConn so non-DoH queries use the
+	// original system resolver transparently.
+	net.DefaultResolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return &selectiveDohConn{
+				ctx:       ctx,
+				dohURL:    dohURL,
+				dohClient: dohClient,
+				shouldDoH: shouldDoH,
+				systemDNS: address, // address is the system DNS server (e.g. "127.0.0.53:53")
+			}, nil
+		},
+	}
 
-	// Patch the dnscache singleton — this is the actual resolver used by tsnet's
-	// controlhttp (controlplane.tailscale.com) and logpolicy (log.tailscale.com).
-	// The singleton is created at package init with &net.Resolver{} (nil Dial),
-	// which bypasses net.DefaultResolver entirely. Replacing .Forward forces all
-	// dnscache lookups through our DoH resolver.
-	dnscache.Get().Forward = dohResolver
+	// Also patch the dnscache singleton — tsnet's controlhttp and logpolicy
+	// use dnscache.Get() which creates its own &net.Resolver{} at init time,
+	// capturing the pre-override DefaultResolver. Setting .Forward ensures
+	// dnscache lookups also go through our selective resolver.
+	dnscache.Get().Forward = net.DefaultResolver
 
 	// resolveHost resolves a hostname, using DoH for Tailscale domains and
 	// system DNS for everything else.
 	resolveHost := func(ctx context.Context, host string) (string, error) {
-		if shouldDoH(host) {
-			ips, err := dohResolver.LookupHost(ctx, host)
-			if err != nil {
-				return "", fmt.Errorf("DoH resolve %s: %w", host, err)
-			}
-			return ips[0], nil
-		}
-		ips, err := systemResolver.LookupHost(ctx, host)
+		ips, err := net.DefaultResolver.LookupHost(ctx, host)
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("resolve %s: %w", host, err)
 		}
 		return ips[0], nil
 	}
@@ -654,19 +660,56 @@ func extractHost(rawURL string) string {
 	return u
 }
 
-// dohConn implements net.Conn to intercept DNS queries and forward them via DoH.
-// Go's resolver writes a raw DNS wire-format query and reads the response.
-type dohConn struct {
+// selectiveDohConn wraps the DNS interception to selectively route queries:
+// domains matching shouldDoH() go to the DoH endpoint, everything else goes
+// to the system DNS server via a plain UDP connection. This ensures ALL DNS
+// code paths in the Go process (tsnet controlhttp, DERP, portmapper, logpolicy)
+// are covered while preserving local DNS for tools like BOFs/assemblies.
+type selectiveDohConn struct {
 	ctx       context.Context
 	dohURL    string
 	dohClient *http.Client
-	resp      []byte // buffered response
+	shouldDoH func(string) bool
+	systemDNS string
+	resp      []byte
 	readPos   int
+	tcpFramed bool
 }
 
-func (c *dohConn) Write(b []byte) (int, error) {
-	// b contains the raw DNS wire-format query
-	req, err := http.NewRequestWithContext(c.ctx, "POST", c.dohURL, bytes.NewReader(b))
+func (c *selectiveDohConn) Write(b []byte) (int, error) {
+	query := b
+	c.tcpFramed = false
+
+	// Detect and strip TCP length prefix.
+	// On Linux, Go's pure-Go resolver prepends a 2-byte TCP length prefix even
+	// when dialing UDP. Secondary DNS flags check prevents Windows false positives.
+	if len(b) > 14 {
+		prefix := int(b[0])<<8 | int(b[1])
+		if prefix == len(b)-2 {
+			flags := uint16(b[2+2])<<8 | uint16(b[2+3])
+			isQuery := flags&0x8000 == 0
+			isStdQuery := flags&0x7800 == 0
+			if isQuery && isStdQuery {
+				c.tcpFramed = true
+				query = b[2:]
+			}
+		}
+	}
+
+	// Parse the queried domain name from DNS wire format.
+	qname := parseDNSQName(query)
+
+	if qname != "" && c.shouldDoH(qname) {
+		// Route via DoH
+		return c.doDoH(query, len(b))
+	}
+
+	// Route via system DNS (plain UDP)
+	return c.doSystemDNS(query, len(b))
+}
+
+func (c *selectiveDohConn) doDoH(query []byte, origLen int) (int, error) {
+	req, err := http.NewRequestWithContext(c.ctx, "POST", c.dohURL, bytes.NewReader(query))
 	if err != nil {
 		return 0, err
 	}
@@ -679,29 +722,109 @@ func (c *dohConn) Write(b []byte) (int, error) {
 	}
 	defer resp.Body.Close()
 
-	c.resp, err = io.ReadAll(resp.Body)
+	dnsResp, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return 0, err
 	}
-	c.readPos = 0
-	return len(b), nil
+	if resp.StatusCode != 200 {
+		return 0, fmt.Errorf("DoH HTTP %d: %s", resp.StatusCode, string(dnsResp))
+	}
+
+	c.storeResponse(dnsResp)
+	return origLen, nil
 }
 
-func (c *dohConn) Read(b []byte) (int, error) {
+func (c *selectiveDohConn) doSystemDNS(query []byte, origLen int) (int, error) {
+	conn, err := net.DialTimeout("udp", c.systemDNS, 5*time.Second)
+	if err != nil {
+		return 0, fmt.Errorf("system DNS dial: %w", err)
+	}
+	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	if _, err := conn.Write(query); err != nil {
+		return 0, fmt.Errorf("system DNS write: %w", err)
+	}
+
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return 0, fmt.Errorf("system DNS read: %w", err)
+	}
+
+	c.storeResponse(buf[:n])
+	return origLen, nil
+}
+
+func (c *selectiveDohConn) storeResponse(dnsResp []byte) {
+	if c.tcpFramed {
+		c.resp = make([]byte, 2+len(dnsResp))
+		c.resp[0] = byte(len(dnsResp) >> 8)
+		c.resp[1] = byte(len(dnsResp))
+		copy(c.resp[2:], dnsResp)
+	} else {
+		c.resp = dnsResp
+	}
+	c.readPos = 0
+}
+
+func (c *selectiveDohConn) Read(b []byte) (int, error) {
 	if c.readPos >= len(c.resp) {
-		return 0, errors.New("no data")
+		return 0, io.EOF
 	}
 	n := copy(b, c.resp[c.readPos:])
 	c.readPos += n
 	return n, nil
 }
 
-func (c *dohConn) Close() error                       { return nil }
-func (c *dohConn) LocalAddr() net.Addr                { return nil }
-func (c *dohConn) RemoteAddr() net.Addr               { return nil }
-func (c *dohConn) SetDeadline(t time.Time) error      { return nil }
-func (c *dohConn) SetReadDeadline(t time.Time) error  { return nil }
-func (c *dohConn) SetWriteDeadline(t time.Time) error { return nil }
+func (c *selectiveDohConn) Close() error                       { return nil }
+func (c *selectiveDohConn) LocalAddr() net.Addr                { return nil }
+func (c *selectiveDohConn) RemoteAddr() net.Addr               { return nil }
+func (c *selectiveDohConn) SetDeadline(t time.Time) error      { return nil }
+func (c *selectiveDohConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *selectiveDohConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// parseDNSQName extracts the first question name from a DNS wire-format query.
+// Returns the domain name as a lowercase dotted string (e.g. "headscale.example.com").
+// Returns "" if the query cannot be parsed.
+func parseDNSQName(msg []byte) string {
+	// DNS header is 12 bytes: ID(2) + Flags(2) + QDCOUNT(2) + ANCOUNT(2) + NSCOUNT(2) + ARCOUNT(2)
+	if len(msg) < 13 {
+		return ""
+	}
+
+	qdcount := int(msg[4])<<8 | int(msg[5])
+	if qdcount == 0 {
+		return ""
+	}
+
+	// Question section starts at offset 12
+	offset := 12
+	var labels []string
+	for offset < len(msg) {
+		labelLen := int(msg[offset])
+		if labelLen == 0 {
+			// End of QNAME
+			break
+		}
+		// Pointer compression (shouldn't appear in queries, but be safe)
+		if labelLen&0xC0 == 0xC0 {
+			return ""
+		}
+		offset++
+		if offset+labelLen > len(msg) {
+			return ""
+		}
+		labels = append(labels, string(msg[offset:offset+labelLen]))
+		offset += labelLen
+	}
+
+	if len(labels) == 0 {
+		return ""
+	}
+	return strings.ToLower(strings.Join(labels, "."))
+}
 
 // ---------- Agent ----------
 

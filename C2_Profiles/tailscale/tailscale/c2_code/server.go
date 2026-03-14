@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"tailscale.com/tsnet"
@@ -119,6 +121,13 @@ func main() {
 	}
 	log.Printf("[+] Listening on tailnet %s:%s", cfg.Hostname, cfg.ListenPort)
 
+	// Validate that our MagicDNS name matches the configured hostname.
+	// If headscale appended a random suffix (e.g. "mythic-c2-abc123") due to
+	// stale node registrations, agents won't be able to resolve us.
+	// Run in background so we don't block the server while waiting for
+	// the node to finish registering.
+	go validateMagicDNS(srv, cfg.Hostname)
+
 	httpClient := &http.Client{
 		Timeout: 60 * time.Second,
 	}
@@ -195,6 +204,73 @@ func main() {
 	if err := http.Serve(ln, mux); err != nil {
 		log.Fatalf("[!] HTTP server error: %v", err)
 	}
+}
+
+// validateMagicDNS checks that our actual MagicDNS name matches the configured
+// hostname. Headscale may append a random suffix (e.g. "mythic-c2-abc123") when
+// a stale node with the same hostname already exists. If this happens, agents
+// cannot resolve the server and checkin will fail silently.
+func validateMagicDNS(srv *tsnet.Server, expectedHostname string) {
+	lc, err := srv.LocalClient()
+	if err != nil {
+		log.Printf("[!] Could not get LocalClient to validate MagicDNS: %v", err)
+		return
+	}
+
+	// Wait for the node to be fully registered and receive its DNS name.
+	// Right after Listen() the state may still be NeedsLogin/Starting,
+	// so Self.DNSName will be empty. Poll for up to 30 seconds.
+	var dnsName string
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		st, err := lc.StatusWithoutPeers(ctx)
+		cancel()
+		if err == nil && st.Self != nil && st.Self.DNSName != "" {
+			dnsName = strings.TrimSuffix(st.Self.DNSName, ".")
+			break
+		}
+		time.Sleep(1 * time.Second)
+	}
+
+	if dnsName == "" {
+		log.Printf("[!] Could not determine MagicDNS name after 30s — node may not be fully registered")
+		return
+	}
+	// Extract short name (first label before the MagicDNS suffix)
+	shortName := dnsName
+	if idx := strings.Index(dnsName, "."); idx > 0 {
+		shortName = dnsName[:idx]
+	}
+
+	if strings.EqualFold(shortName, expectedHostname) {
+		log.Printf("[+] MagicDNS name verified: %s", dnsName)
+		return
+	}
+
+	log.Printf("========================================================================")
+	log.Printf("[!] WARNING: MagicDNS name mismatch!")
+	log.Printf("[!]   Expected hostname: %s", expectedHostname)
+	log.Printf("[!]   Actual DNS name:   %s (short: %s)", dnsName, shortName)
+	log.Printf("[!]")
+	log.Printf("[!] Agents will try to connect to '%s' but the control server", expectedHostname)
+	log.Printf("[!] registered this node as '%s'. This usually happens when", shortName)
+	log.Printf("[!] stale nodes with the same hostname exist on the control server.")
+	log.Printf("[!]")
+	log.Printf("[!] To fix this:")
+	log.Printf("[!]   For Headscale:")
+	log.Printf("[!]     1. List nodes:  headscale nodes list")
+	log.Printf("[!]     2. Delete stale nodes with the same hostname:")
+	log.Printf("[!]        headscale nodes delete -i <ID> --force")
+	log.Printf("[!]     3. Rename this node:")
+	log.Printf("[!]        headscale nodes rename -i <ID> %s", expectedHostname)
+	log.Printf("[!]     4. OR: clear the ts-state directory and restart this server")
+	log.Printf("[!]   For Tailscale:")
+	log.Printf("[!]     1. Go to https://login.tailscale.com/admin/machines")
+	log.Printf("[!]     2. Remove stale '%s' machines", expectedHostname)
+	log.Printf("[!]     3. Rename this machine to '%s'", expectedHostname)
+	log.Printf("[!]     4. OR: clear the ts-state directory and restart this server")
+	log.Printf("========================================================================")
 }
 
 // serveTCP accepts TCP connections and handles length-prefixed binary framing.

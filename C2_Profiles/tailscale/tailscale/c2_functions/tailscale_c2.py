@@ -27,7 +27,8 @@ async def generate_config(input: C2OtherServiceRPCMessage) -> C2OtherServiceRPCM
 
         # Create ephemeral, reusable pre-auth key with tag:agent
         if provider == "headscale":
-            auth_key = await _create_headscale_key(control_url, api_key)
+            headscale_user = config.get("headscale_user", "1")
+            auth_key = await _create_headscale_key(control_url, api_key, headscale_user)
         else:
             tailnet = config.get("tailnet", "")
             if not tailnet:
@@ -51,18 +52,23 @@ async def generate_config(input: C2OtherServiceRPCMessage) -> C2OtherServiceRPCM
     return response
 
 
-async def _create_headscale_key(control_url: str, api_key: str) -> str:
+async def _create_headscale_key(control_url: str, api_key: str, user: str = "1") -> str:
     """Create a pre-auth key via Headscale API."""
+    from datetime import datetime, timedelta, timezone
     url = f"{control_url.rstrip('/')}/api/v1/preauthkey"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
+    # Headscale treats missing/zero expiration as already expired,
+    # so we must always set an explicit expiration timestamp.
+    expiration = (datetime.now(timezone.utc) + timedelta(days=90)).strftime("%Y-%m-%dT%H:%M:%SZ")
     payload = {
-        "user": "mythic",
+        "user": user,
         "reusable": True,
         "ephemeral": True,
         "aclTags": ["tag:agent"],
+        "expiration": expiration,
     }
 
     async with aiohttp.ClientSession() as session:
