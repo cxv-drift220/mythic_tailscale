@@ -24,6 +24,7 @@ A lightweight, cross-platform Mythic agent written in Go that embeds a `tsnet` c
 - In-memory Tailscale state — no files written to disk
 - Built-in commands: `shell`, `ls`, `cat`, `cd`, `pwd`, `ps`, `whoami`, `hostname`, `ifconfig`, `env`, `sleep`
 - SOCKS5 proxy support for pivoting
+- DoH support to prevent `*.tailscale.com` DNS leaks
 
 ## Quick Start
 
